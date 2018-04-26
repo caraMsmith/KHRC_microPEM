@@ -1,0 +1,171 @@
+---
+title: "MicroPEM Weekly Report"
+output: pdf_document
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.height= 10, fig.width=7.5}
+
+
+#MicroPEM upload and inital data check
+#microPEM files collected in Ghana
+
+#Batch upload of microPEM files
+
+library(plyr)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(zoo)
+library(knitr)
+library(kableExtra)
+setwd("/Applications/Rdata/Ghana_microPEM/Colo_test")
+
+#Individual microPEM tests
+#Upload all Files
+colotest <- list.files(".", recursive = T, pattern = "^(UCC)", full.names = T)
+length(colotest)
+
+#create columns with Sample ID, Unit ID, and Filter ID from file name
+#combine date and time columns
+pem.import <- function(PEM){
+  colotest_01 <- read.csv(PEM, skip = 28, stringsAsFactors = F, header = T, row.names = NULL)  
+  names(colotest_01) <- c("Date", "Time","PM", "Temp",	"RH",	"Battery",	"InletPress",	"FlowOrificePress",	"Flow",	"Xaxis",	"Yaxis",	"Zaxis",	"VectorSumComposite", "action", "Wearing Compliance", "ValidityWearingCompliance validation")
+  filename <- PEM
+  filename2 <- sub(".csv", "", filename)
+  filename2 <- sub("./", "", filename2)
+  filename_vec <- strsplit(filename2, split = "_")[[1]]
+  colotest_01$UnitID <- filename_vec[1]
+  colotest_01$FilterID <- filename_vec[2]
+  colotest_01$SampleID <- filename_vec[3]
+  colotest_01$Date <-dmy(colotest_01$Date)
+  colotest_01$Datetime <- as.POSIXct(paste(colotest_01$Date, colotest_01$Time), origin="1970-01-01",format = "%Y-%m-%d %H:%M:%S",tz='Africa/Accra')
+  colotest_01}
+
+
+names(colotest) <- colotest
+
+colotest_stack <- ldply(colotest, pem.import, .progress = "text")
+
+
+#Create minute averages data table
+colotest_stack$Time_minute <- floor_date(colotest_stack$Datetime, unit = "minute")
+
+colotest_minavg <- colotest_stack %>% group_by(UnitID, FilterID, SampleID, Time_minute) %>% summarise(mean(PM, na.rm = TRUE), mean(Temp, na.rm = TRUE),
+                                                                                  mean(RH, na.rm = TRUE),mean(Battery, na.rm = TRUE), mean(InletPress, na.rm = TRUE),
+                                                                                  mean(FlowOrificePress, na.rm = TRUE), mean(Flow, na.rm = TRUE),
+                                                                                  mean(VectorSumComposite, na.rm = TRUE), sd(VectorSumComposite, na.rm = TRUE) )
+
+#Change Colmn names
+names(colotest_minavg) <- c("UnitID", "FilterID","SampleID", "Time",	"PM",	"Temp","RH","Battery","InletPress",	"FlowOrificePress",	"Flow",	"VectorSumComposite", "SD_VectorSumComposite")
+
+colotest_minavg <- na.omit(colotest_minavg)
+
+#### Calculate compliance
+#### sd of comp > 0.02 ? Rolling over how many minutes? 
+#### used 0.02 as threshold and rolling average of 10 minutes. Change/adjust if needed
+
+colotest_minavg$compliance_thres <- ifelse(colotest_minavg$SD_VectorSumComposite > 0.02, 1, 0)
+
+#rolling mean 
+
+# calculate rollmean compliance
+
+colotest_minavg$sd_composite_rollmean <- as.numeric(rollapply(colotest_minavg$compliance_thres, width=10,  FUN = mean, align = "center", na.rm = TRUE, fill = NA)) 
+
+colotest_minavg$compliance_rollmean <- ifelse(colotest_minavg$sd_composite_rollmean > 0, 1, 0)
+
+if (sum(!is.na(colotest_minavg$compliance_rollmean)) > 0) {
+  colotest_minavg.complete <-  colotest_minavg[complete.cases(colotest_minavg),] 
+} else {
+  colotest_minavg.complete <- colotest_minavg
+}
+    
+
+
+#Creating 24 hour periods. Need to do after minute average to cut timepoints without PM data (i.e when the USB is connected)
+no.days <- ceiling(as.numeric(as.duration(colotest_minavg.complete$Time[nrow(colotest_minavg.complete)] - colotest_minavg.complete$Time[1]))/86400) # calculates the difference in time between last and first datetime observation (in seconds), transforms it into days and returns the ceiling of days
+    
+dayindex <- colotest_minavg.complete$Time[1] + hours(seq(from = 24, to = no.days*24, by = 24))
+    
+    colotest_minavg.complete$unique_24h <- 1
+    
+    for (i in 1:no.days) { 
+      colotest_minavg.complete$unique_24h <- ifelse ((colotest_minavg.complete$Time > dayindex[i]),  i+1, colotest_minavg.complete$unique_24h)
+    } 
+    
+
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis', fig.align='center', fig.height= 10, fig.width=7.5}
+# Run times table 
+
+rows.per.group  <- aggregate(rep(1, length(paste0(colotest_minavg$UnitID, colotest_minavg$FilterID, colotest_minavg$SampleID))),
+                             by=list(colotest_minavg$UnitID, colotest_minavg$FilterID, colotest_minavg$SampleID), sum)
+names(rows.per.group) <- c("Unit ID", "Filter ID","Sample ID", "Run Time")
+rows.per.group$`Run Time` <- round(rows.per.group$`Run Time`/60, digits = 1)
+
+rows.per.group %>% mutate(
+  `Run Time`= cell_spec(`Run Time`, "latex", color = ifelse(`Run Time` <48, "red", "blue"))) %>%
+kable(format = "latex", booktabs = T, escape = F,linesep = "") %>%
+  kable_styling(latex_options = c("striped"),font_size = 18,
+                full_width = F) 
+
+
+
+```
+\newpage 
+
+#Compliance (hours) by 24 hour periods
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+
+
+
+colotest_minavg.complete_d2 <- ddply(colotest_minavg.complete, .(UnitID, FilterID, SampleID, unique_24h), summarise,  hours_worn = round(sum((compliance_rollmean)/60, na.rm = TRUE), digits = 2))
+names(colotest_minavg.complete_d2) <- c("UnitID","FilterID","SampleID", "Day", "Hours Worn")
+
+
+colotest_minavg.complete_d2 %>% 
+kable(format = "latex", booktabs = T, escape = F,linesep = "") %>%
+  kable_styling(latex_options = c("striped"), font_size = 18,
+                full_width = F)
+
+
+``` 
+
+\newpage 
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.height= 5, fig.width=7}
+ggplot(colotest_minavg, aes(x=Time, y=Flow, color= UnitID)) + geom_point() + ggtitle("Flow")
+
+ggplot(colotest_minavg, aes(x=Time, y=Flow, color= UnitID)) + geom_point() +  facet_wrap(~UnitID) + theme(axis.text.x = element_text(angle = 90))
+
+
+```
+\newpage 
+
+#PM 2.5* timeseries plots
+
+*Plot are the RH-corrected Neph values. There are no HEPA or filter corrections added here.
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.height= 5, fig.width=7}
+
+
+ggplot(colotest_minavg, aes(x=Time, y=PM, color= UnitID)) + geom_point() + ggtitle("PM2.5")
+ggplot(colotest_minavg, aes(x=Time, y=PM, color= UnitID)) + geom_line() + ggtitle("PM2.5")
+
+
+ggplot(colotest_minavg, aes(x=Time, y=PM, color= UnitID)) + geom_line() +  facet_wrap(~UnitID)+theme(axis.text.x = element_text(angle = 90))
+
+
+ggplot(colotest_minavg, aes(x=Time, y=Battery, color= UnitID)) + geom_point() + ggtitle("Battery (V)")
+ggplot(colotest_minavg, aes(x=Time, y=RH, color= UnitID)) + geom_point() + ggtitle("RH (%)")
+ggplot(colotest_minavg, aes(x=Time, y=Temp, color= UnitID)) + geom_point() + ggtitle("Temperature (C)")
+
+
+ggplot(colotest_minavg, aes(x=Time, y=SD_VectorSumComposite, color= UnitID)) + geom_point() + ggtitle("Standard Deviation of Activity")
+
+
+
+```

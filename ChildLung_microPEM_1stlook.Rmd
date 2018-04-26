@@ -1,0 +1,241 @@
+---
+title: "microPEM First Look"
+output: pdf_document
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.height= 10, fig.width=7.5}
+
+
+#MicroPEM upload and inital data check
+#microPEM files collected in Ghana
+
+#Batch upload of microPEM files
+
+library(plyr)
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+setwd("/Applications/Rdata/Ghana_microPEM/Colo_test") # change for correct file path
+
+#Individual microPEM tests
+#Upload all Files
+indTest <- list.files(".", recursive = T, pattern = "^(UGF320414N)", full.names = T) #can edit pattern based on file name you want. '
+length(indTest)
+
+#create columns with Sample ID, Unit ID, and Filter ID from file name
+#combine date and time columns
+pem.import <- function(PEM){
+  indtest_01 <- read.csv(PEM, skip = 28, stringsAsFactors = F, header = T, row.names = NULL)  
+  names(indtest_01) <- c("Date", "Time","PM", "Temp",	"RH",	"Battery",	"InletPress",	"FlowOrificePress",	"Flow",	"Xaxis",	"Yaxis",	"Zaxis",	"VectorSumComposite", "action", "Wearing Compliance", "ValidityWearingCompliance validation")
+  filename <- PEM
+  filename2 <- sub(".csv", "", filename)
+  filename2 <- sub("./", "", filename2)
+  filename_vec <- strsplit(filename2, split = "_")[[1]]
+  indtest_01$UnitID <- filename_vec[1] 
+  indtest_01$FilterID <- filename_vec[2]
+  indtest_01$SampleID <- filename_vec[3]
+  indtest_01$Date <-dmy(indtest_01$Date)
+  indtest_01$Datetime <- as.POSIXct(paste(indtest_01$Date, indtest_01$Time), origin="1970-01-01",format = "%Y-%m-%d %H:%M:%S",tz='Africa/Accra')
+  indtest_01}
+
+
+names(indTest) <- indTest
+
+indTest_stack <- ldply(indTest, pem.import, .progress = "text")
+
+#check for low bat stop 
+batt <- filter(indTest_stack, action == "Low Battery Stop")
+
+#Create minute averages data table
+indTest_stack$Time_minute <- floor_date(indTest_stack$Datetime, unit = "minute")
+
+indtest_minavg <- indTest_stack %>% group_by(UnitID, FilterID, SampleID, Time_minute) %>% summarise(Date[1], mean(PM, na.rm = TRUE), mean(Temp, na.rm = TRUE),
+                                                                                  mean(RH, na.rm = TRUE),mean(Battery, na.rm = TRUE), mean(InletPress, na.rm = TRUE),
+                                                                                  mean(FlowOrificePress, na.rm = TRUE), mean(Flow, na.rm = TRUE),
+                                                                                  mean(VectorSumComposite, na.rm = TRUE), sd(VectorSumComposite, na.rm = TRUE) )
+
+#Change Colmn names
+names(indtest_minavg) <- c("UnitID", "FilterID","SampleID", "Time","Date","PM",	"Temp","RH","Battery","InletPress",	"FlowOrificePress",	"Flow",	"VectorSumComposite", "SD_VectorSumComposite")
+
+#### Calculate compliance
+#### sd of comp > 0.02 ? Rolling over how many minutes? 
+#### used 0.02 as threshold and rolling average of 10 minutes. Change/adjust if needed
+
+indtest_minavg$compliance_thres <- ifelse(indtest_minavg$SD_VectorSumComposite > 0.02, 1, 0)
+
+#rolling mean 
+
+# calculate rollmean compliance
+library(zoo)
+indtest_minavg$sd_composite_rollmean <- as.numeric(rollapply(indtest_minavg$compliance_thres, width=10,  FUN = mean, align = "center", na.rm = TRUE, fill = NA)) 
+
+indtest_minavg$compliance_rollmean <- ifelse(indtest_minavg$sd_composite_rollmean > 0, 1, 0)
+
+if (sum(!is.na(indtest_minavg$compliance_rollmean)) > 0) {
+  indtest_minavg.complete <-  indtest_minavg[complete.cases(indtest_minavg),] 
+} else {
+  indtest_minavg.complete <- indtest_minavg
+}
+    
+
+
+#Creating 24 hour periods. Need to do after minute average to cut timepoints without PM data (i.e when the USB is connected)
+no.days <- ceiling(as.numeric(as.duration(indtest_minavg.complete$Time[nrow(indtest_minavg.complete)] - indtest_minavg.complete$Time[1]))/86400) # calculates the difference in time between last and first datetime observation (in seconds), transforms it into days and returns the ceiling of days
+    
+dayindex <- indtest_minavg.complete$Time[1] + hours(seq(from = 24, to = no.days*24, by = 24))
+    
+    indtest_minavg.complete$unique_24h <- 1
+    
+    for (i in 1:no.days) { 
+      indtest_minavg.complete$unique_24h <- ifelse ((indtest_minavg.complete$Time > dayindex[i]),  i+1, indtest_minavg.complete$unique_24h)
+    } 
+    
+    
+
+  
+####Add HEPA corrections.....
+
+library(changepoint)
+
+Data5 <- subset(indTest_stack, !is.na(PM))
+Data4 <- subset(indTest_stack, !is.na(PM))
+
+Data6 = Data5[7:100,]   # exclude the first 6 readings (about 1 minute)
+HEPASt = cpt.meanvar(Data6$PM,method="BinSeg", Q=3, minseglen=8)
+Data4$HEPAstnumber = HEPASt@cpts[1]        # identify the place where changepoint is
+if(Data4$HEPAstnumber==94){                # if there is no changepoint in the first 100 readings then no start HEPA
+  Data4$HEPAsttime1 = NA
+  Data4$HEPAsttime2 = NA
+  Data4$HEPAstvalue1 = NA
+  Data4$HEPAstvalue2 = NA
+} else {
+  Data4$HEPAsttime1 = Data5$Datetime[7]              # the starttime of start HEPA
+  Data4$HEPAsttime2 = Data5$Datetime[Data4$HEPAstnumber+6]   # the endtime of start HEPA
+  # the mean nephelometer reading in start HEPA
+  Data4$HEPAstvalue1 = mean(Data6$PM[1:Data4$HEPAstnumber]) 
+  # the mean nephelometer reading after start HEPA period (within the first 100 readings)
+  Data4$HEPAstvalue2 = mean(Data6$PM[(Data4$HEPAstnumber+1):94])
+}
+
+
+# ending HEPA
+Data7 = Data5[(nrow(Data5)-3):(nrow(Data5)-99),]   # exclude the last 3 readings (about 30 secs)
+HEPAEnd = cpt.meanvar(Data7$PM,method="BinSeg", Q=3, minseglen=8)
+Data4$HEPAendnumber = HEPAEnd@cpts[1]        # identify the place where changepoint is
+if(Data4$HEPAendnumber==97){                # if there is no changepoint in the last 100 readings then no start HEPA
+  Data4$HEPAendtime1 = NA
+  Data4$HEPAendtime2 = NA
+  Data4$HEPAendvalue1 = NA
+  Data4$HEPAendvalue2 = NA
+} else {
+  Data4$HEPAendtime1 = Data5$Datetime[nrow(Data5)-2-Data4$HEPAendnumber]              # the starttime of end HEPA
+  Data4$HEPAendtime2 = Data5$Datetime[nrow(Data5)-3]   # the endtime of end HEPA
+  # the mean nephelometer reading in end HEPA
+  Data4$HEPAendvalue1 = mean(Data7$PM[1:Data4$HEPAendnumber]) 
+  # the mean nephelometer reading after end HEPA period (within the first 100 readings)
+  Data4$HEPAendvalue2 = mean(Data7$PM[(Data4$HEPAendnumber+1):97])
+}
+  
+Data4$HEPAstart [Data4$HEPAstvalue1 <= 20 & Data4$HEPAstvalue1 >= -20] <- "Yes"
+Data4$HEPAstart [Data4$HEPAstvalue1 >= 20 & Data4$HEPAstvalue1 <= -20] <- "No"
+
+Data4$HEPAEnd [Data4$HEPAendvalue1 <= 20 & Data4$HEPAendvalue1 >= -20] <- "Yes"
+Data4$HEPAEnd [Data4$HEPAendvalue1 >= 20 & Data4$HEPAendvalue1 <= -20] <- "No"
+
+
+
+```
+
+Start Time | End Time | Run Time | Mean PM | Median PM | Unit ID | Filter ID | SampleID
+-----------|----------|-----------|--------|----------|-----------|----------|------
+`r as.character(min(indtest_minavg$Time))`  | `r as.character(max(indtest_minavg$Time))` | `r paste(round(nrow(indtest_minavg)/60, digits = 1), "hours")` |`r paste(round(mean(indtest_minavg$PM, na.rm = T), digits = 1), "ug/m^3")` |`r paste(round(median(indtest_minavg$PM, na.rm = T), digits = 1), "ug/m^3")`| `r indtest_minavg$UnitID[1]`| `r indtest_minavg$FilterID[1]`| `r indtest_minavg$SampleID[1]`
+
+
+Start HEPA|Start HEPA Mean PM | Post Start HEPA Mean PM
+:----------:|:--------------:|:----------:|:-------------:
+`r Data4$HEPAstart[1]` |`r round(Data4$HEPAstvalue1[1], digits = 3) ` | `r round(Data4$HEPAstvalue2[1], digits = 3) `  
+
+
+
+End HEPA | End Mean HEPA PM | Pre End HEPA Mean PM | Low Battery Stop?
+:----------:|:-------------:|:-------------:|:-------------:
+`r Data4$HEPAEnd[1]`  | `r round(Data4$HEPAendvalue1[1], digits = 3) ` | `r round(Data4$HEPAendvalue2[1], digits = 3) ` | `r as.character(batt$action)`
+
+
+
+#Run Time (hours) by Date
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+
+rows.per.group_date  <- aggregate(rep(1, length(paste0(indtest_minavg$Date))),
+                             by=list(indtest_minavg$Date), sum)
+names(rows.per.group_date) <- c("Date", "Hours")
+rows.per.group_date$Hours <- round(rows.per.group_date$Hours/60, digits = 1)
+
+knitr::kable(rows.per.group_date, caption = "")
+```
+
+#Run Time (hours) by 24 hour periods
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+
+rows.per.group_date  <- aggregate(rep(1, length(paste0(indtest_minavg.complete$unique_24h))),
+                             by=list(indtest_minavg.complete$unique_24h), sum)
+names(rows.per.group_date) <- c("24 hour period", "Hours")
+rows.per.group_date$Hours <- round(rows.per.group_date$Hours/60, digits = 1)
+
+knitr::kable(rows.per.group_date, caption = "")
+```
+
+#Compliance (hours) by Date 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+
+
+indtest_minavg.complete_d <- ddply(indtest_minavg.complete, .(Date), summarise,  hours_worn = round(sum((compliance_rollmean)/60, na.rm = TRUE), digits = 2))
+names(indtest_minavg.complete_d) <- c("Date", "Hours Worn")
+knitr::kable(indtest_minavg.complete_d, caption = "")
+
+``` 
+
+#Compliance (hours) by 24 hour periods
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='asis'}
+
+
+indtest_minavg.complete_d2 <- ddply(indtest_minavg.complete, .(unique_24h), summarise,  hours_worn = round(sum((compliance_rollmean)/60, na.rm = TRUE), digits = 2))
+names(indtest_minavg.complete_d2) <- c("Date", "Hours Worn")
+knitr::kable(indtest_minavg.complete_d2, caption = "")
+
+``` 
+
+#PM 2.5* timeseries plots
+
+*Plot are the RH-corrected Neph values. There are no HEPA or filter corrections added here.
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.height= 5, fig.width=7}
+
+ggplot(indtest_minavg, aes(x=Time, y=Flow, color= SampleID)) + geom_point(color = "#00CCFF") + ggtitle("PM2.5")
+
+ggplot(indtest_minavg, aes(x=Time, y=PM, color= SampleID)) + geom_point(color = "#00CCFF") + ggtitle("PM2.5")
+ggplot(indtest_minavg, aes(x=Time, y=PM, color= SampleID)) + geom_line(color = "#00CCFF") + ggtitle("PM2.5")
+
+# plot the first 100 readings and show the changepoint
+title <-paste("Average during Start HEPA =", round(mean(Data4$HEPAstvalue1), digits = 3 ), "\n", "PM vs Time on 10 second base")
+plot(HEPASt,cpt.width=3) + title(main = title,  cex.main = 0.7, col.main = "black") 
+
+# plot the end 100 readings and show the changepoint
+title <-paste("Average during End HEPA =", round(mean(Data4$HEPAendvalue1), digits = 3 ), "\n", "PM vs 'Reverse Time' on 10 second base")
+plot(HEPAEnd,cpt.width=3) + title(main = title,  cex.main = 0.7, col.main = "black") 
+
+
+ggplot(indtest_minavg, aes(x=Time, y=Battery, color= SampleID)) + geom_point(color = "#CC33CC") + ggtitle("Battery (V)")
+ggplot(indtest_minavg, aes(x=Time, y=RH, color= SampleID)) + geom_point(color = "#666600") + ggtitle("RH (%)")
+ggplot(indtest_minavg, aes(x=Time, y=Temp, color= SampleID)) + geom_point() + ggtitle("Temperature (C)")
+
+ggplot(indtest_minavg, aes(x=Time, y=VectorSumComposite, color= SampleID)) + geom_point(color ="#00CC99") + ggtitle("Activity (g)")
+
+ggplot(indtest_minavg, aes(x=Time, y=SD_VectorSumComposite, color= SampleID)) + geom_point(color = "#00CC99") + ggtitle("Standard Deviation of Activity")
+
+
+
+```
